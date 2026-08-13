@@ -176,6 +176,39 @@ def processar_fonte(df, col_nota, col_data, col_valor, col_evento, usar_data):
     agrupado = res.groupby(chave, as_index=False).agg({'valor': 'sum', 'evento': 'last'})
     return agrupado
 
+def detectar_empresa(df):
+    """Procura coluna de razão social/nome da empresa e retorna o valor mais frequente."""
+    candidatos = [c for c in df.columns if any(t in normalizar(c) for t in
+                  ["RAZAO SOCIAL", "NOME EMPRESA", "NOME DA EMPRESA", "EMITENTE", "EMPRESA"])
+                  and "CODIGO" not in normalizar(c) and "CNPJ" not in normalizar(c)]
+    for c in candidatos:
+        valores = df[c].dropna().astype(str).str.strip()
+        valores = valores[valores != ""]
+        if not valores.empty:
+            moda = valores.mode()
+            if not moda.empty:
+                return moda.iloc[0]
+    return None
+
+def detectar_competencia(df, col_data):
+    """Deriva mês/ano predominante a partir da coluna de data, ou de uma coluna explícita de competência."""
+    if col_data and col_data != "Nenhuma":
+        datas = df[col_data].apply(converter_data).dropna()
+        if not datas.empty:
+            meses = datas.apply(lambda d: f"{d.month:02d}/{d.year}")
+            moda = meses.mode()
+            if not moda.empty:
+                return moda.iloc[0]
+    candidatos = [c for c in df.columns if any(t in normalizar(c) for t in ["COMPETENCIA", "PERIODO"])]
+    for c in candidatos:
+        valores = df[c].dropna().astype(str).str.strip()
+        valores = valores[valores != ""]
+        if not valores.empty:
+            moda = valores.mode()
+            if not moda.empty:
+                return moda.iloc[0]
+    return None
+
 # =========================================================
 # INTERFACE
 # =========================================================
@@ -201,12 +234,6 @@ NOME_COLUNA_VALOR = {
     "SIEG": "Valor SIEG",
     "Dominio": "Valor Domínio",
 }
-
-col_emp, col_comp = st.columns(2)
-with col_emp:
-    empresa = st.text_input("🏢 Empresa")
-with col_comp:
-    competencia = st.text_input("🗓️ Competência (ex: 08/2026)")
 
 col_tipo, col_fontes = st.columns(2)
 with col_tipo:
@@ -264,9 +291,34 @@ for i, fonte in enumerate(fontes_selecionadas):
                     "fonte": fonte, "df": df_bruto,
                     "col_nota": col_nota, "col_data": col_data,
                     "col_valor": col_valor, "col_evento": col_evento,
+                    "empresa_detectada": detectar_empresa(df_bruto),
+                    "competencia_detectada": detectar_competencia(df_bruto, col_data),
                 }
 
 st.write("---")
+
+# --- Empresa e Competência: auto-preenchidas a partir das planilhas, mas editáveis ---
+empresa_sugerida = next((d["empresa_detectada"] for d in dados_fontes.values() if d.get("empresa_detectada")), None)
+competencia_sugerida = next((d["competencia_detectada"] for d in dados_fontes.values() if d.get("competencia_detectada")), None)
+
+if empresa_sugerida and not st.session_state.get("empresa_input"):
+    st.session_state["empresa_input"] = empresa_sugerida
+if competencia_sugerida and not st.session_state.get("competencia_input"):
+    st.session_state["competencia_input"] = competencia_sugerida
+
+col_emp, col_comp = st.columns(2)
+with col_emp:
+    empresa = st.text_input("🏢 Empresa", key="empresa_input")
+    if empresa_sugerida:
+        st.caption("🔎 Detectado automaticamente a partir da planilha — pode editar.")
+with col_comp:
+    competencia = st.text_input("🗓️ Competência (ex: 08/2026)", key="competencia_input")
+    if competencia_sugerida:
+        st.caption("🔎 Detectado automaticamente a partir da planilha — pode editar.")
+
+st.write("---")
+
+
 
 fontes_prontas = list(dados_fontes.keys())
 if len(fontes_prontas) < 2:
@@ -346,7 +398,7 @@ if st.button("🚀 Cruzar Dados e Buscar Divergências", type="primary", use_con
                         matriz_df.loc[dados_fontes[ca]["fonte"], dados_fontes[cb]["fonte"]] = totais[ca] - totais[cb]
 
                 with st.expander("🔍 Ver comparação completa entre as 3 fontes (todos os pares)"):
-                    st.dataframe(matriz_df.applymap(formatar_moeda_br), use_container_width=True)
+                    st.dataframe(matriz_df.apply(lambda col: col.map(formatar_moeda_br)), use_container_width=True)
                     st.caption("Cada célula é (linha − coluna). Ex: a célula SIEG/Domínio mostra o quanto o total do SIEG está acima ou abaixo do total da Domínio.")
 
             # --- Análise linha a linha: ausências e divergência de valor ---
