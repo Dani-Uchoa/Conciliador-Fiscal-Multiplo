@@ -1,0 +1,8 @@
+streamlit
+starlette==0.37.2
+pandas
+openpyxl
+xlsxwriter
+xlrd
+lxml
+beautifulsoup4
