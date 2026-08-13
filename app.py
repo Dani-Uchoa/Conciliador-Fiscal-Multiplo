@@ -61,14 +61,13 @@ def extrair_identificador_nota(n, tipo_doc):
         digitos = digitos[25:34]
     return digitos.lstrip('0') if digitos else ""
 
-def verificar_status_invalido(txt):
+def extrair_texto_status(txt):
     """
-    Retorna True se o registro indicar Cancelamento, Denegação, Inutilização ou Desconhecimento.
+    Higieniza e retorna a string original do status/situação da nota.
     """
-    if pd.isna(txt): return False
-    s = normalizar(txt)
-    termos_invalidos = ["CANCEL", "DENEG", "INUTILIZ", "DESC. OP", "DESCONHEC"]
-    return any(termo in s for termo in termos_invalidos)
+    if pd.isna(txt): return "Autorizada/Normal"
+    s = str(txt).strip()
+    return s if s else "Autorizada/Normal"
 
 # =========================================================
 # DETECTOR DE CABEÇALHO E LEITURA
@@ -151,7 +150,7 @@ def sugerir_colunas(cols):
     return idx_nota, idx_data, idx_valor, idx_evento
 
 # =========================================================
-# PROCESSAMENTO DAS FONTES (COM PURGA DE INVALIDADAS)
+# PROCESSAMENTO DAS FONTES (INCLUI TODAS AS NOTAS E STATUS)
 # =========================================================
 def processar_fonte(df, col_nota, col_data, col_valor, col_evento, usar_data, tipo_doc):
     res = pd.DataFrame()
@@ -165,11 +164,12 @@ def processar_fonte(df, col_nota, col_data, col_valor, col_evento, usar_data, ti
     res['valor'] = df[col_valor].apply(limpar_valor)
     
     if col_evento and col_evento != "Nenhuma":
-        res['invalida'] = df[col_evento].apply(verificar_status_invalido)
+        res['status'] = df[col_evento].apply(extrair_texto_status)
     else:
-        res['invalida'] = False
+        res['status'] = "Autorizada/Normal"
 
-    res = res[(res['nota'] != "") & (~res['invalida'])].copy()
+    # Mantém todas as notas que possuem identificador válido
+    res = res[res['nota'] != ""].copy()
 
     if usar_data:
         res = res.dropna(subset=['data'])
@@ -177,7 +177,7 @@ def processar_fonte(df, col_nota, col_data, col_valor, col_evento, usar_data, ti
     else:
         chave = ['nota']
 
-    agrupado = res.groupby(chave, as_index=False).agg({'valor': 'sum'})
+    agrupado = res.groupby(chave, as_index=False).agg({'valor': 'sum', 'status': 'last'})
     return agrupado
 
 # =========================================================
@@ -262,7 +262,7 @@ for i, fonte in enumerate(fontes_selecionadas):
                     key=f"sel_valor_{codigo}_{i}"
                 )
                 col_evento = st.selectbox(
-                    "Status / Situação (Filtra Canceladas)", 
+                    "Status / Situação da Nota", 
                     opcoes_com_nenhuma,
                     index=(idx_evento + 1) if idx_evento is not None else 0, 
                     key=f"sel_evento_{codigo}_{i}"
@@ -288,7 +288,7 @@ if usar_data:
         st.stop()
 
 if st.button("🚀 Processar Conciliação e Retornar Divergências", type="primary", use_container_width=True, key="btn_processar_conciliacao"):
-    with st.spinner("Lendo relatórios, eliminando canceladas e cruzando bases..."):
+    with st.spinner("Lendo relatórios e cruzando todas as notas..."):
         try:
             processados = {}
             for codigo in fontes_prontas:
@@ -297,7 +297,7 @@ if st.button("🚀 Processar Conciliação e Retornar Divergências", type="prim
                     cfg["df"], cfg["col_nota"], cfg["col_data"], cfg["col_valor"], 
                     cfg["col_evento"], usar_data, tipo_doc
                 )
-                rename_map = {"valor": f"valor_{codigo}"}
+                rename_map = {"valor": f"valor_{codigo}", "status": f"status_{codigo}"}
                 if not usar_data:
                     rename_map["data"] = f"data_{codigo}"
                 agrupado = agrupado.rename(columns=rename_map)
@@ -306,13 +306,15 @@ if st.button("🚀 Processar Conciliação e Retornar Divergências", type="prim
             chave = ['nota', 'data'] if usar_data else ['nota']
             m = reduce(lambda l, r: pd.merge(l, r, on=chave, how='outer'), processados.values())
 
-            st.subheader("📊 Totais Válidos Consolidados (Sem Canceladas)")
+            # Totais Brutos Consolidados (Inclui todas as movimentações)
+            st.subheader("📊 Totais Brutos Consolidados (Todas as Notas e Status)")
             metricas = st.columns(len(fontes_prontas))
             for i, codigo in enumerate(fontes_prontas):
                 total = m[f"valor_{codigo}"].fillna(0).sum()
                 with metricas[i]:
-                    st.metric(f"Total Válido — {dados_fontes[codigo]['fonte']}", formatar_moeda_br(total))
+                    st.metric(f"Total Bruto — {dados_fontes[codigo]['fonte']}", formatar_moeda_br(total))
 
+            # Analisa Divergências de Valores e Ausências
             def analisar_divergencia(row):
                 ausentes = [c for c in fontes_prontas if pd.isna(row[f"valor_{c}"])]
                 presentes = {c: row[f"valor_{c}"] for c in fontes_prontas if c not in ausentes}
@@ -327,8 +329,18 @@ if st.button("🚀 Processar Conciliação e Retornar Divergências", type="prim
                     if max(vals) - min(vals) > 0.01:
                         situacoes.append("Divergência de Valor")
 
+                # Monta resumo dos status informados nas fontes
+                status_partes = []
+                for c in fontes_prontas:
+                    st_val = row.get(f"status_{c}", "")
+                    if pd.notna(st_val) and str(st_val).strip():
+                        status_partes.append(f"{dados_fontes[c]['fonte']}: {st_val}")
+                    else:
+                        status_partes.append(f"{dados_fontes[c]['fonte']}: Ausente")
+
                 return pd.Series({
                     "Situação": " | ".join(situacoes),
+                    "Status Consolidado": " | ".join(status_partes),
                     "_divergente": bool(situacoes)
                 })
 
@@ -344,12 +356,12 @@ if st.button("🚀 Processar Conciliação e Retornar Divergências", type="prim
             divergencias = divergencias.sort_values(by=chave)
 
             st.write("---")
-            st.subheader("🔍 Relatório Exclusivo de Divergências")
+            st.subheader("🔍 Relatório Exclusivo de Divergências e Inconsistências")
 
             if divergencias.empty:
-                st.success("✅ **Conciliação sem divergências:** Todas as notas válidas presentes nas bases possuem os mesmos valores.")
+                st.success("✅ **Conciliação perfeita:** Todas as notas e valores bateram exatamente entre as fontes selecionadas.")
             else:
-                st.warning(f"Foram encontradas **{len(divergencias)}** inconsistências entre os relatórios.")
+                st.warning(f"Foram encontradas **{len(divergencias)}** divergências/ausências entre os relatórios.")
 
                 exib = pd.DataFrame()
                 exib["Chave / Número NF"] = divergencias["nota"]
@@ -364,10 +376,12 @@ if st.button("🚀 Processar Conciliação e Retornar Divergências", type="prim
                     )
 
                 exib["Motivo da Inconsistência"] = divergencias["Situação"]
+                exib["Status das Fontes"] = divergencias["Status Consolidado"]
                 exib = exib.reset_index(drop=True)
 
                 st.dataframe(exib, use_container_width=True)
 
+                # Exportação para Excel
                 export_df = pd.DataFrame()
                 export_df["Chave_Numero_NF"] = divergencias["nota"]
                 if usar_data:
@@ -377,8 +391,10 @@ if st.button("🚀 Processar Conciliação e Retornar Divergências", type="prim
 
                 for c in fontes_prontas:
                     export_df[f"Valor_{dados_fontes[c]['fonte']}"] = divergencias[f"valor_{c}"]
+                    export_df[f"Status_{dados_fontes[c]['fonte']}"] = divergencias[f"status_{c}"]
 
                 export_df["Motivo_Inconsistencia"] = divergencias["Situação"]
+                export_df["Status_Consolidado"] = divergencias["Status Consolidado"]
 
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
