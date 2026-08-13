@@ -9,7 +9,7 @@ st.set_page_config(page_title="Conciliador Fiscal Universal", layout="wide")
 st.title("⚖️ Conciliador Fiscal Universal — Multi-Fonte")
 
 # =========================================================
-# UTILITÁRIOS & TRATAMENTO DE TEXTO/MOEDA
+# UTILITÁRIOS
 # =========================================================
 def formatar_moeda_br(valor):
     try:
@@ -45,35 +45,29 @@ def converter_data(d):
     try: return pd.to_datetime(s, dayfirst=True, errors='raise').date()
     except: return pd.to_datetime(s, errors='coerce').date()
 
-def extrair_identificador_nota(n, tipo_doc):
-    """
-    Retorna a Chave de 44 dígitos completa para NFe/NFCe/CTe.
-    Usa apenas a numeração sequencial para NFSe ou quando a chave não estiver completa.
-    """
+def extrair_nota_limpa(n):
     if pd.isna(n): return ""
     s = str(n).strip()
-    digitos = re.sub(r'\D', '', s)
-    
-    if len(digitos) == 44 and tipo_doc != "NFSe":
-        return digitos
-    
-    if len(digitos) == 44:
-        digitos = digitos[25:34]
-    return digitos.lstrip('0') if digitos else ""
+    s = re.sub(r'\D', '', s)
+    if len(s) == 44: s = s[25:34]
+    return s.lstrip('0') if s else ""
 
-def extrair_texto_status(txt):
-    """
-    Higieniza e retorna a string original do status/situação da nota.
-    """
-    if pd.isna(txt): return "Autorizada/Normal"
+def extrair_ultimo_evento(txt):
+    """Retorna o status quando a nota está Cancelada / Desc. Op. Denegada. Não filtra, só sinaliza."""
+    if pd.isna(txt): return ""
     s = str(txt).strip()
-    return s if s else "Autorizada/Normal"
+    if not s: return ""
+    ultimo = s.split(',')[-1].strip()
+    teste = normalizar(ultimo)
+    if "DESC" in teste or "CANCEL" in teste or "DENEG" in teste:
+        return ultimo
+    return ""
 
 # =========================================================
-# DETECTOR DE CABEÇALHO E LEITURA
+# DETECTOR DE CABEÇALHO
 # =========================================================
 def encontrar_cabecalho(df):
-    termos_fortes = ["CHAVE", "NOTA", "DATA", "VALOR", "EMISSAO", "NUMERO", "NUM NFSE", "CNPJ", "EVENTO", "SITUACAO"]
+    termos_fortes = ["CHAVE", "NOTA", "DATA", "VALOR", "EMISSAO", "NUMERO", "NUM NFSE", "CNPJ", "EVENTO"]
     for i in range(min(len(df), 50)):
         linha = [normalizar(str(c)) for c in df.iloc[i]]
         matches = sum(1 for c in linha if any(t in c for t in termos_fortes))
@@ -86,6 +80,9 @@ def encontrar_cabecalho(df):
         if matches >= 2: return i
     return 0
 
+# =========================================================
+# MOTOR DE LEITURA (mantido do original — cobre CSV, XLS/XLSX, HTML disfarçado)
+# =========================================================
 def carregar_planilha(f):
     f.seek(0)
     conteudo = f.read()
@@ -97,6 +94,7 @@ def carregar_planilha(f):
         primeira_linha = texto.split('\n')[0] if '\n' in texto else texto
         separador = ';' if ';' in primeira_linha else ','
         df = pd.read_csv(io.StringIO(texto), sep=separador, dtype=str, header=None, engine='python', on_bad_lines='skip')
+
     else:
         is_real_xls = conteudo.startswith(b'\xD0\xCF\x11\xE0')
         is_real_xlsx = conteudo.startswith(b'PK')
@@ -111,7 +109,7 @@ def carregar_planilha(f):
                         separador = ';' if ';' in texto_esmagado.split('\n')[0] else ','
                         df = pd.read_csv(io.StringIO(texto_esmagado), sep=separador, dtype=str, header=None, engine='python', on_bad_lines='skip')
             except Exception:
-                st.error(f"🛑 **ARQUIVO CORROMPIDO:** O arquivo '{f.name}' possui falhas na matriz binária. Abra-o no Excel e salve-o como '.xlsx'.")
+                st.error(f"🛑 **ARQUIVO CORROMPIDO NA ORIGEM:** O arquivo '{f.name}' exportado pelo sistema possui defeitos na matriz binária. \n\nPara garantir a integridade da conciliação, abra este arquivo no Excel do seu computador e selecione **'Salvar Como -> Pasta de Trabalho do Excel (.xlsx)'** antes de enviar.")
                 return pd.DataFrame()
         else:
             try:
@@ -120,7 +118,9 @@ def carregar_planilha(f):
             except Exception:
                 try: texto = conteudo.decode('utf-8')
                 except UnicodeDecodeError: texto = conteudo.decode('latin1', errors='replace')
-                sep = '\t' if '\t' in texto else (';' if ';' in texto else ',')
+                if '\t' in texto: sep = '\t'
+                elif ';' in texto: sep = ';'
+                else: sep = ','
                 df = pd.read_csv(io.StringIO(texto), sep=sep, dtype=str, header=None, engine='python', on_bad_lines='skip')
 
     if df is None or df.empty: return pd.DataFrame()
@@ -146,30 +146,26 @@ def sugerir_colunas(cols):
     idx_nota = next((i for i, c in enumerate(cols) if any(t in normalizar(c) for t in ["CHAVE", "NOTA", "NUMERO", "NUM NFSE", "NUM", "DOC"])), 0)
     idx_data = next((i for i, c in enumerate(cols) if any(t in normalizar(c) for t in ["DATA", "EMISSAO", "ENTRADA"])), 0)
     idx_valor = next((i for i, c in enumerate(cols) if any(t in normalizar(c) for t in ["VALOR", "CONTABIL"])), 0)
-    idx_evento = next((i for i, c in enumerate(cols) if any(t in normalizar(c) for t in ["EVENTO", "STATUS", "SITUACAO", "TIPO"])), None)
+    idx_evento = next((i for i, c in enumerate(cols) if ("EVENTO" in normalizar(c) and "CODIGO" not in normalizar(c)) or ("TIPO" in normalizar(c) and "EVENTO" in normalizar(c)) or "STATUS" in normalizar(c) or "SITUACAO" in normalizar(c)), None)
     return idx_nota, idx_data, idx_valor, idx_evento
 
 # =========================================================
-# PROCESSAMENTO DAS FONTES (INCLUI TODAS AS NOTAS E STATUS)
+# PROCESSAMENTO POR FONTE
 # =========================================================
-def processar_fonte(df, col_nota, col_data, col_valor, col_evento, usar_data, tipo_doc):
+def processar_fonte(df, col_nota, col_data, col_valor, col_evento, usar_data):
     res = pd.DataFrame()
-    res['nota'] = df[col_nota].apply(lambda x: extrair_identificador_nota(x, tipo_doc))
-    
+    res['nota'] = df[col_nota].apply(extrair_nota_limpa)
     if col_data and col_data != "Nenhuma":
         res['data'] = df[col_data].apply(converter_data)
     else:
         res['data'] = None
-        
     res['valor'] = df[col_valor].apply(limpar_valor)
-    
     if col_evento and col_evento != "Nenhuma":
-        res['status'] = df[col_evento].apply(extrair_texto_status)
+        res['evento'] = df[col_evento].apply(extrair_ultimo_evento)
     else:
-        res['status'] = "Autorizada/Normal"
+        res['evento'] = ""
 
-    # Mantém todas as notas que possuem identificador válido
-    res = res[res['nota'] != ""].copy()
+    res = res[res['nota'] != ""]
 
     if usar_data:
         res = res.dropna(subset=['data'])
@@ -177,12 +173,14 @@ def processar_fonte(df, col_nota, col_data, col_valor, col_evento, usar_data, ti
     else:
         chave = ['nota']
 
-    agrupado = res.groupby(chave, as_index=False).agg({'valor': 'sum', 'status': 'last'})
+    agrupado = res.groupby(chave, as_index=False).agg({'valor': 'sum', 'evento': 'last'})
     return agrupado
 
 # =========================================================
-# INTERFACE PRINCIPAL
+# INTERFACE
 # =========================================================
+st.info("💡 **Atenção:** Arquivos defeituosos de alguns sistemas exigem reparo no Excel (Salvar Como .xlsx).")
+
 TIPOS_DOC = {
     "NFe Entrada": False,
     "NFe Saída": True,
@@ -197,37 +195,45 @@ FONTES_DISPONIVEIS = {
     "Domínio": "Dominio",
 }
 
+# Nome fixo de coluna de valor por fonte, para o relatório final
+NOME_COLUNA_VALOR = {
+    "Origem": "Valor Fonte Originária",
+    "SIEG": "Valor SIEG",
+    "Dominio": "Valor Domínio",
+}
+
+col_emp, col_comp = st.columns(2)
+with col_emp:
+    empresa = st.text_input("🏢 Empresa")
+with col_comp:
+    competencia = st.text_input("🗓️ Competência (ex: 08/2026)")
+
 col_tipo, col_fontes = st.columns(2)
 with col_tipo:
-    tipo_doc = st.radio(
-        "📄 **Tipo de documento fiscal:**", 
-        list(TIPOS_DOC.keys()), 
-        horizontal=False,
-        key="radio_tipo_documento_main"
-    )
-    
+    tipo_doc = st.radio("📄 **Tipo de documento fiscal:**", list(TIPOS_DOC.keys()), horizontal=False)
     usar_data = st.checkbox(
-        "Cruzar também pela DATA (além da Chave/Número)",
+        "Cruzar também pela DATA (além do número da nota)",
         value=TIPOS_DOC[tipo_doc],
-        help="Habilitado por padrão para Saídas/Serviços. Para entradas, o ideal é desabilitar caso a data de emissão difira da data de entrada na Domínio.",
-        key="chk_usar_data_main"
+        help="Ligado por padrão para Saída/NFCe/CTe/NFSe, desligado para Entrada — mas você pode ajustar."
     )
+    mostrar_data = tipo_doc != "NFe Entrada"
 
 with col_fontes:
     fontes_selecionadas = st.multiselect(
-        "🔗 **Selecione as fontes para o cruzamento:** (mínimo 2)",
+        "🔗 **Quais fontes você vai subir nesta rodada?** (mín. 2)",
         list(FONTES_DISPONIVEIS.keys()),
-        default=list(FONTES_DISPONIVEIS.keys()),
-        key="multi_fontes_selecionadas_main"
+        default=list(FONTES_DISPONIVEIS.keys())
     )
 
 st.write("---")
 
 if len(fontes_selecionadas) < 2:
-    st.warning("Selecione ao menos 2 fontes para realizar o confronto.")
+    st.warning("Selecione ao menos 2 fontes para cruzar.")
     st.stop()
 
-dados_fontes = {}
+# --- Upload e mapeamento de colunas por fonte ---
+dados_fontes = {}  # codigo -> dict com df bruto e colunas escolhidas
+
 n_fontes = len(fontes_selecionadas)
 cols_layout = st.columns(n_fontes)
 
@@ -243,29 +249,15 @@ for i, fonte in enumerate(fontes_selecionadas):
                 idx_nota, idx_data, idx_valor, idx_evento = sugerir_colunas(cols)
                 opcoes_com_nenhuma = ["Nenhuma"] + cols
 
-                col_nota = st.selectbox(
-                    "Chave / Número NF", 
-                    cols, 
-                    index=idx_nota, 
-                    key=f"sel_nota_{codigo}_{i}"
-                )
+                col_nota = st.selectbox("Nota/Chave", cols, index=idx_nota, key=f"nota_{codigo}")
                 col_data = st.selectbox(
-                    "Data" + (" (obrigatória)" if usar_data else " (opcional)"),
-                    opcoes_com_nenhuma, 
-                    index=idx_data + 1, 
-                    key=f"sel_data_{codigo}_{i}"
+                    "Data" + (" (obrigatória)" if usar_data else " (opcional, só referência)"),
+                    opcoes_com_nenhuma, index=idx_data + 1, key=f"data_{codigo}"
                 )
-                col_valor = st.selectbox(
-                    "Valor Total", 
-                    cols, 
-                    index=idx_valor, 
-                    key=f"sel_valor_{codigo}_{i}"
-                )
+                col_valor = st.selectbox("Valor", cols, index=idx_valor, key=f"valor_{codigo}")
                 col_evento = st.selectbox(
-                    "Status / Situação da Nota", 
-                    opcoes_com_nenhuma,
-                    index=(idx_evento + 1) if idx_evento is not None else 0, 
-                    key=f"sel_evento_{codigo}_{i}"
+                    "Status/Evento (opcional)", opcoes_com_nenhuma,
+                    index=(idx_evento + 1) if idx_evento is not None else 0, key=f"evento_{codigo}"
                 )
 
                 dados_fontes[codigo] = {
@@ -278,26 +270,23 @@ st.write("---")
 
 fontes_prontas = list(dados_fontes.keys())
 if len(fontes_prontas) < 2:
-    st.info("Carregue os arquivos e valide o mapeamento das colunas para liberar a conciliação.")
+    st.info("Suba pelo menos 2 relatórios com as colunas mapeadas para liberar o cruzamento.")
     st.stop()
 
 if usar_data:
     faltando_data = [dados_fontes[c]["fonte"] for c in fontes_prontas if dados_fontes[c]["col_data"] == "Nenhuma"]
     if faltando_data:
-        st.error(f"Selecione a coluna de data para as seguintes fontes: {', '.join(faltando_data)}.")
+        st.error(f"Você marcou 'cruzar por data', mas não selecionou coluna de data para: {', '.join(faltando_data)}.")
         st.stop()
 
-if st.button("🚀 Processar Conciliação e Retornar Divergências", type="primary", use_container_width=True, key="btn_processar_conciliacao"):
-    with st.spinner("Lendo relatórios e cruzando todas as notas..."):
+if st.button("🚀 Cruzar Dados e Buscar Divergências", type="primary", use_container_width=True):
+    with st.spinner("Cruzando informações fiscais..."):
         try:
             processados = {}
             for codigo in fontes_prontas:
                 cfg = dados_fontes[codigo]
-                agrupado = processar_fonte(
-                    cfg["df"], cfg["col_nota"], cfg["col_data"], cfg["col_valor"], 
-                    cfg["col_evento"], usar_data, tipo_doc
-                )
-                rename_map = {"valor": f"valor_{codigo}", "status": f"status_{codigo}"}
+                agrupado = processar_fonte(cfg["df"], cfg["col_nota"], cfg["col_data"], cfg["col_valor"], cfg["col_evento"], usar_data)
+                rename_map = {"valor": f"valor_{codigo}", "evento": f"evento_{codigo}"}
                 if not usar_data:
                     rename_map["data"] = f"data_{codigo}"
                 agrupado = agrupado.rename(columns=rename_map)
@@ -306,106 +295,157 @@ if st.button("🚀 Processar Conciliação e Retornar Divergências", type="prim
             chave = ['nota', 'data'] if usar_data else ['nota']
             m = reduce(lambda l, r: pd.merge(l, r, on=chave, how='outer'), processados.values())
 
-            # Totais Brutos Consolidados (Inclui todas as movimentações)
-            st.subheader("📊 Totais Brutos Consolidados (Todas as Notas e Status)")
+            # --- Totais consolidados (antes de filtrar por divergência) ---
+            st.subheader("📊 Totais Consolidados")
+            if empresa or competencia:
+                st.caption(f"{empresa or '—'} · Competência: {competencia or '—'} · {tipo_doc}")
+
+            totais = {codigo: m[f"valor_{codigo}"].fillna(0).sum() for codigo in fontes_prontas}
+
             metricas = st.columns(len(fontes_prontas))
             for i, codigo in enumerate(fontes_prontas):
-                total = m[f"valor_{codigo}"].fillna(0).sum()
                 with metricas[i]:
-                    st.metric(f"Total Bruto — {dados_fontes[codigo]['fonte']}", formatar_moeda_br(total))
+                    st.metric(f"Soma {dados_fontes[codigo]['fonte']}", formatar_moeda_br(totais[codigo]))
 
-            # Analisa Divergências de Valores e Ausências
-            def analisar_divergencia(row):
+            # Diferença Total em destaque quando só há 2 fontes (comportamento anterior)
+            if len(fontes_prontas) == 2:
+                codigo_a, codigo_b = fontes_prontas
+                diferenca_total = totais[codigo_a] - totais[codigo_b]
+                st.metric(
+                    "Diferença Total",
+                    formatar_moeda_br(diferenca_total),
+                    delta=f"{diferenca_total:,.2f} R$" if abs(diferenca_total) > 0.01 else None,
+                    delta_color="inverse" if abs(diferenca_total) > 0.01 else "normal"
+                )
+
+            # Resumo por relatório: valor total e diferença vs referência (Domínio se presente, senão a 1ª fonte)
+            referencia = "Dominio" if "Dominio" in fontes_prontas else fontes_prontas[0]
+            nome_referencia = dados_fontes[referencia]["fonte"]
+            total_referencia = totais[referencia]
+
+            resumo_linhas = []
+            for codigo in fontes_prontas:
+                linha = {"Relatório": dados_fontes[codigo]["fonte"], "Valor Total": totais[codigo]}
+                linha[f"Diferença vs {nome_referencia}"] = totais[codigo] - total_referencia
+                resumo_linhas.append(linha)
+            resumo_df = pd.DataFrame(resumo_linhas)
+
+            st.markdown(f"**Resumo por relatório** (referência: {nome_referencia})")
+            resumo_exib = resumo_df.copy()
+            resumo_exib["Valor Total"] = resumo_exib["Valor Total"].apply(formatar_moeda_br)
+            resumo_exib[f"Diferença vs {nome_referencia}"] = resumo_exib[f"Diferença vs {nome_referencia}"].apply(formatar_moeda_br)
+            st.dataframe(resumo_exib, use_container_width=True, hide_index=True)
+
+            # Comparação completa entre todas as fontes (só quando há 3) — escondida por padrão
+            matriz_df = None
+            if len(fontes_prontas) == 3:
+                nomes = [dados_fontes[c]["fonte"] for c in fontes_prontas]
+                matriz_df = pd.DataFrame(index=nomes, columns=nomes, dtype=float)
+                for ca in fontes_prontas:
+                    for cb in fontes_prontas:
+                        matriz_df.loc[dados_fontes[ca]["fonte"], dados_fontes[cb]["fonte"]] = totais[ca] - totais[cb]
+
+                with st.expander("🔍 Ver comparação completa entre as 3 fontes (todos os pares)"):
+                    st.dataframe(matriz_df.applymap(formatar_moeda_br), use_container_width=True)
+                    st.caption("Cada célula é (linha − coluna). Ex: a célula SIEG/Domínio mostra o quanto o total do SIEG está acima ou abaixo do total da Domínio.")
+
+            # --- Análise linha a linha: ausências e divergência de valor ---
+            def analisar_linha(row):
                 ausentes = [c for c in fontes_prontas if pd.isna(row[f"valor_{c}"])]
                 presentes = {c: row[f"valor_{c}"] for c in fontes_prontas if c not in ausentes}
                 situacoes = []
-                
                 if ausentes:
                     nomes_ausentes = [dados_fontes[c]["fonte"] for c in ausentes]
-                    situacoes.append("Falta em: " + ", ".join(nomes_ausentes))
-                
+                    situacoes.append("Ausente em: " + ", ".join(nomes_ausentes))
                 if len(presentes) >= 2:
                     vals = list(presentes.values())
                     if max(vals) - min(vals) > 0.01:
-                        situacoes.append("Divergência de Valor")
+                        situacoes.append("Valor divergente")
 
-                # Monta resumo dos status informados nas fontes
                 status_partes = []
                 for c in fontes_prontas:
-                    st_val = row.get(f"status_{c}", "")
-                    if pd.notna(st_val) and str(st_val).strip():
-                        status_partes.append(f"{dados_fontes[c]['fonte']}: {st_val}")
-                    else:
-                        status_partes.append(f"{dados_fontes[c]['fonte']}: Ausente")
+                    ev = row.get(f"evento_{c}", "")
+                    if isinstance(ev, str) and ev.strip():
+                        status_partes.append(f"{dados_fontes[c]['fonte']}: {ev.strip()}")
 
                 return pd.Series({
-                    "Situação": " | ".join(situacoes),
-                    "Status Consolidado": " | ".join(status_partes),
+                    "Motivo da Inconsistência": " | ".join(situacoes),
+                    "Status (Cancelamento/Denegação)": " | ".join(status_partes),
                     "_divergente": bool(situacoes)
                 })
 
-            extras = m.apply(analisar_divergencia, axis=1)
+            extras = m.apply(analisar_linha, axis=1)
             m = pd.concat([m, extras], axis=1)
             divergencias = m[m["_divergente"]].copy()
 
-            if not usar_data:
-                data_ref_cols = [f"data_{c}" for c in fontes_prontas if f"data_{c}" in divergencias.columns]
-                if data_ref_cols:
-                    divergencias["Data (Ref)"] = divergencias[data_ref_cols].bfill(axis=1).iloc[:, 0]
+            # --- Coluna Data: exibida sempre, exceto para NFe Entrada ---
+            # Se a data faz parte da chave, já está em 'data'. Senão, usa a primeira
+            # data disponível entre as fontes como referência.
+            if mostrar_data:
+                if usar_data:
+                    divergencias["Data"] = divergencias["data"]
+                else:
+                    data_ref_cols = [f"data_{c}" for c in fontes_prontas if f"data_{c}" in divergencias.columns]
+                    if data_ref_cols:
+                        divergencias["Data"] = divergencias[data_ref_cols].bfill(axis=1).iloc[:, 0]
+                    else:
+                        divergencias["Data"] = None
 
             divergencias = divergencias.sort_values(by=chave)
 
             st.write("---")
-            st.subheader("🔍 Relatório Exclusivo de Divergências e Inconsistências")
+            st.subheader("🔍 Divergências Encontradas")
 
             if divergencias.empty:
-                st.success("✅ **Conciliação perfeita:** Todas as notas e valores bateram exatamente entre as fontes selecionadas.")
+                st.success("🎉 Excelente! As fontes bateram — nenhuma divergência encontrada.")
             else:
-                st.warning(f"Foram encontradas **{len(divergencias)}** divergências/ausências entre os relatórios.")
+                st.warning(f"Foram identificadas {len(divergencias)} notas com inconsistências.")
 
+                # Montagem da tabela de exibição (moeda formatada)
                 exib = pd.DataFrame()
-                exib["Chave / Número NF"] = divergencias["nota"]
-                if usar_data:
-                    exib["Data"] = pd.to_datetime(divergencias["data"]).dt.strftime('%d/%m/%Y')
-                elif "Data (Ref)" in divergencias.columns:
-                    exib["Data (Ref)"] = pd.to_datetime(divergencias["Data (Ref)"], errors='coerce').dt.strftime('%d/%m/%Y')
+                if empresa: exib["Empresa"] = empresa
+                if competencia: exib["Competência"] = competencia
+                exib["Número da Nota"] = divergencias["nota"]
+                if mostrar_data:
+                    exib["Data"] = pd.to_datetime(divergencias["Data"], errors='coerce').dt.strftime('%d/%m/%Y')
 
                 for c in fontes_prontas:
-                    exib[f"Valor - {dados_fontes[c]['fonte']}"] = divergencias[f"valor_{c}"].apply(
-                        lambda v: "— (Ausente)" if pd.isna(v) else formatar_moeda_br(v)
+                    exib[NOME_COLUNA_VALOR[c]] = divergencias[f"valor_{c}"].apply(
+                        lambda v: "— (ausente)" if pd.isna(v) else formatar_moeda_br(v)
                     )
 
-                exib["Motivo da Inconsistência"] = divergencias["Situação"]
-                exib["Status das Fontes"] = divergencias["Status Consolidado"]
+                exib["Motivo da Inconsistência"] = divergencias["Motivo da Inconsistência"]
+                exib["Status (Cancelamento/Denegação)"] = divergencias["Status (Cancelamento/Denegação)"]
                 exib = exib.reset_index(drop=True)
 
                 st.dataframe(exib, use_container_width=True)
 
-                # Exportação para Excel
+                # Exportação em Excel (valores numéricos, não formatados, para o usuário trabalhar em cima)
                 export_df = pd.DataFrame()
-                export_df["Chave_Numero_NF"] = divergencias["nota"]
-                if usar_data:
-                    export_df["Data"] = pd.to_datetime(divergencias["data"]).dt.strftime('%d/%m/%Y')
-                elif "Data (Ref)" in divergencias.columns:
-                    export_df["Data"] = pd.to_datetime(divergencias["Data (Ref)"], errors='coerce').dt.strftime('%d/%m/%Y')
-
+                if empresa: export_df["Empresa"] = [empresa] * len(divergencias)
+                if competencia: export_df["Competência"] = [competencia] * len(divergencias)
+                export_df["Número da Nota"] = divergencias["nota"].values
+                if mostrar_data:
+                    export_df["Data"] = pd.to_datetime(divergencias["Data"], errors='coerce').dt.strftime('%d/%m/%Y').values
                 for c in fontes_prontas:
-                    export_df[f"Valor_{dados_fontes[c]['fonte']}"] = divergencias[f"valor_{c}"]
-                    export_df[f"Status_{dados_fontes[c]['fonte']}"] = divergencias[f"status_{c}"]
-
-                export_df["Motivo_Inconsistencia"] = divergencias["Situação"]
-                export_df["Status_Consolidado"] = divergencias["Status Consolidado"]
+                    export_df[NOME_COLUNA_VALOR[c]] = divergencias[f"valor_{c}"].values
+                export_df["Motivo da Inconsistência"] = divergencias["Motivo da Inconsistência"].values
+                export_df["Status (Cancelamento/Denegação)"] = divergencias["Status (Cancelamento/Denegação)"].values
 
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                     export_df.to_excel(writer, index=False, sheet_name='Divergências')
+                    resumo_df.to_excel(writer, index=False, sheet_name='Resumo')
+                    if matriz_df is not None:
+                        matriz_df.to_excel(writer, sheet_name='Comparação Completa')
 
+                partes_nome = [p for p in [empresa, competencia, tipo_doc.replace(' ', '_')] if p]
+                nome_arquivo = "divergencias_" + "_".join(partes_nome).replace('/', '-').replace(' ', '_') + ".xlsx"
                 st.download_button(
-                    label="📥 Baixar Planilha de Divergências (.xlsx)",
+                    label="📥 Baixar Planilha de Divergências",
                     data=output.getvalue(),
-                    file_name=f"divergencias_conciliacao_{tipo_doc.replace(' ', '_')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="btn_download_excel"
+                    file_name=nome_arquivo,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
         except Exception as e:
-            st.error(f"Erro no processamento da conciliação: {e}")
+            st.error(f"Erro processual: {e}")
