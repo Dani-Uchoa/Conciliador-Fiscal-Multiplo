@@ -48,6 +48,10 @@ def converter_data(d):
 def extrair_nota_limpa(n):
     if pd.isna(n): return ""
     s = str(n).strip()
+    if '/' in s:
+        # Formato "8221/8221" (mesmo número repetido) — usa a primeira parte
+        partes = [p.strip() for p in s.split('/') if p.strip()]
+        if partes: s = partes[0]
     s = re.sub(r'\D', '', s)
     if len(s) == 44: s = s[25:34]
     return s.lstrip('0') if s else ""
@@ -87,38 +91,43 @@ def valor_esta_vazio(v):
     return s == ""
 
 def extrair_metadados(df_raw, idx_cabecalho):
-    """Varre as linhas ANTES do cabeçalho da tabela em busca de 'Empresa:' e 'Competência:'/'Período:'."""
+    """Varre as linhas ANTES do cabeçalho da tabela em busca de 'Empresa:' e 'Competência:'/'Período:'.
+    O valor nem sempre está na célula vizinha (colunas mescladas deixam NaN no meio),
+    então pega a próxima célula NÃO VAZIA da mesma linha."""
     metadados = {"empresa": None, "competencia": None}
     limite = min(idx_cabecalho, len(df_raw))
+
     for i in range(limite):
         linha = df_raw.iloc[i]
-        for j, cel in enumerate(linha):
-            if pd.isna(cel): continue
-            texto = str(cel).strip()
-            if not texto: continue
+        celulas = [(j, str(v).strip()) for j, v in enumerate(linha) if pd.notna(v) and str(v).strip() != ""]
+
+        for pos, (j, texto) in enumerate(celulas):
             texto_norm = normalizar(texto)
+            rotulo = texto_norm.replace(':', '').strip()
 
-            if metadados["empresa"] is None and "EMPRESA" in texto_norm:
-                if ':' in texto:
-                    valor = texto.split(':', 1)[1].strip()
+            if metadados["empresa"] is None and rotulo == "EMPRESA":
+                if pos + 1 < len(celulas):
+                    valor = celulas[pos + 1][1]
                     if valor:
                         metadados["empresa"] = valor
-                        continue
-                if j + 1 < len(linha) and pd.notna(linha.iloc[j + 1]):
-                    valor = str(linha.iloc[j + 1]).strip()
-                    if valor and "EMPRESA" not in normalizar(valor):
-                        metadados["empresa"] = valor
 
-            if metadados["competencia"] is None and any(t in texto_norm for t in ["COMPETENCIA", "PERIODO"]):
-                if ':' in texto:
-                    valor = texto.split(':', 1)[1].strip()
+            if metadados["competencia"] is None and rotulo in ["COMPETENCIA", "PERIODO"]:
+                if pos + 1 < len(celulas):
+                    valor = celulas[pos + 1][1]
                     if valor:
                         metadados["competencia"] = valor
-                        continue
-                if j + 1 < len(linha) and pd.notna(linha.iloc[j + 1]):
-                    valor = str(linha.iloc[j + 1]).strip()
-                    if valor:
-                        metadados["competencia"] = valor
+
+    # Heurística: quando não há rótulo "Empresa:" explícito, alguns relatórios (ex: Domínio Saídas)
+    # trazem a razão social sozinha na primeira célula da primeira linha.
+    if metadados["empresa"] is None and len(df_raw) > 0:
+        primeira_celula = df_raw.iloc[0, 0]
+        if pd.notna(primeira_celula):
+            texto = str(primeira_celula).strip()
+            texto_norm = normalizar(texto)
+            termos_societarios = {"LTDA", "S/A", "S.A", "EIRELI", "ME", "EPP", "MEI"}
+            if texto and texto == texto.upper() and termos_societarios & set(texto_norm.replace('.', ' ').split()):
+                metadados["empresa"] = texto
+
     return metadados
 
 # =========================================================
@@ -227,8 +236,9 @@ def processar_fonte(df, col_nota, col_data, col_valor, col_evento, usar_data, de
     else:
         chave = ['nota']
 
-    # Duplicidade: mesma chave E mesmo valor repetidos no arquivo original
-    dup_mask = res.duplicated(subset=chave + ['valor'], keep=False)
+    # Duplicidade: mesma NOTA e mesmo VALOR repetidos no arquivo original — independe da data,
+    # já que notas com o mesmo número mas CFOP/valor diferentes são splits legítimos, não duplicidade.
+    dup_mask = res.duplicated(subset=['nota', 'valor'], keep=False)
     notas_duplicadas = set(res.loc[dup_mask, 'nota'])
 
     agrupado = res.groupby(chave, as_index=False).agg({'valor': 'sum', 'evento': 'last'})
@@ -320,12 +330,12 @@ NOME_COLUNA_VALOR = {
 col_tipo, col_fontes = st.columns(2)
 with col_tipo:
     tipo_doc = st.radio("📄 **Tipo de documento fiscal:**", list(TIPOS_DOC.keys()), horizontal=False)
-    usar_data = st.checkbox(
-        "Cruzar também pela DATA (além do número da nota)",
-        value=TIPOS_DOC[tipo_doc],
-        help="Ligado por padrão para Saída/NFCe/CTe/NFSe, desligado para Entrada — mas você pode ajustar."
-    )
+    usar_data = TIPOS_DOC[tipo_doc]
     mostrar_data = tipo_doc != "NFe Entrada"
+    st.caption(
+        "Cruzamento automático: **só por número da nota** para Entrada; "
+        "**nota + data** para os demais tipos."
+    )
 
 with col_fontes:
     fontes_selecionadas = st.multiselect(
@@ -364,10 +374,10 @@ for i, fonte in enumerate(fontes_selecionadas):
                     opcoes_com_nenhuma, index=idx_data + 1, key=f"data_{codigo}"
                 )
                 col_valor = st.selectbox("Valor", cols, index=idx_valor, key=f"valor_{codigo}")
-                col_evento = st.selectbox(
-                    "Status/Evento (opcional)", opcoes_com_nenhuma,
-                    index=(idx_evento + 1) if idx_evento is not None else 0, key=f"evento_{codigo}"
-                )
+
+                # Status/Evento é detectado automaticamente pela varredura das colunas —
+                # só entra no motivo da inconsistência se realmente existir.
+                col_evento = cols[idx_evento] if idx_evento is not None else "Nenhuma"
 
                 dados_fontes[codigo] = {
                     "fonte": fonte, "df": df_bruto,
@@ -558,7 +568,7 @@ if st.button("🚀 Cruzar Dados e Buscar Divergências", type="primary", use_con
 
                 for c in fontes_prontas:
                     exib[NOME_COLUNA_VALOR[c]] = divergencias[f"valor_{c}"].apply(
-                        lambda v: "— (ausente)" if pd.isna(v) else formatar_moeda_br(v)
+                        lambda v: "" if pd.isna(v) else formatar_moeda_br(v)
                     )
 
                 exib["Motivo da Inconsistência"] = divergencias["Motivo da Inconsistência"]
@@ -577,6 +587,10 @@ if st.button("🚀 Cruzar Dados e Buscar Divergências", type="primary", use_con
 
                 output = io.BytesIO()
                 linha_inicio = 3  # espaço para o cabeçalho (Empresa/Competência/Tipo)
+                totais_df = pd.DataFrame([
+                    {"Relatório": dados_fontes[c]["fonte"], "Valor Total": totais[c]} for c in fontes_prontas
+                ])
+
                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                     export_df.to_excel(writer, index=False, sheet_name='Divergências', startrow=linha_inicio)
                     ws = writer.sheets['Divergências']
@@ -584,12 +598,18 @@ if st.button("🚀 Cruzar Dados e Buscar Divergências", type="primary", use_con
                     ws.write(1, 0, f"Competência: {competencia or '-'}")
                     ws.write(2, 0, f"Tipo de Documento: {tipo_doc}")
 
+                    # Aba Resumo: valor total de todas as fontes sempre presente,
+                    # + comparação em pares quando há 3 fontes.
+                    totais_df.to_excel(writer, index=False, sheet_name='Resumo', startrow=linha_inicio)
+                    ws2 = writer.sheets['Resumo']
+                    ws2.write(0, 0, f"Empresa: {empresa or '-'}")
+                    ws2.write(1, 0, f"Competência: {competencia or '-'}")
+                    ws2.write(2, 0, f"Tipo de Documento: {tipo_doc}")
+
                     if resumo_df is not None and not resumo_df.empty:
-                        resumo_df.to_excel(writer, index=False, sheet_name='Resumo', startrow=linha_inicio)
-                        ws2 = writer.sheets['Resumo']
-                        ws2.write(0, 0, f"Empresa: {empresa or '-'}")
-                        ws2.write(1, 0, f"Competência: {competencia or '-'}")
-                        ws2.write(2, 0, f"Tipo de Documento: {tipo_doc}")
+                        inicio_comparacao = linha_inicio + len(totais_df) + 3
+                        ws2.write(inicio_comparacao - 1, 0, "Comparação entre fontes")
+                        resumo_df.to_excel(writer, index=False, sheet_name='Resumo', startrow=inicio_comparacao)
 
                 partes_nome = [p for p in [empresa, competencia, tipo_doc.replace(' ', '_')] if p]
                 nome_arquivo = "divergencias_" + "_".join(partes_nome).replace('/', '-').replace(' ', '_') + ".xlsx"
