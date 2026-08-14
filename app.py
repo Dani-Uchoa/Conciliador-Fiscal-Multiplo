@@ -194,7 +194,11 @@ def sugerir_colunas(cols):
 # =========================================================
 # PROCESSAMENTO POR FONTE
 # =========================================================
-def processar_fonte(df, col_nota, col_data, col_valor, col_evento, usar_data):
+def processar_fonte(df, col_nota, col_data, col_valor, col_evento, usar_data, desconsiderar_zero=False):
+    """Processa uma fonte e retorna (agrupado, notas_duplicadas).
+    notas_duplicadas: notas que apareceram mais de uma vez com o MESMO valor antes do agrupamento
+    (indício de linha duplicada no arquivo original, não de múltiplos lançamentos legítimos).
+    """
     res = pd.DataFrame()
     res['nota'] = df[col_nota].apply(extrair_nota_limpa)
     if col_data and col_data != "Nenhuma":
@@ -209,8 +213,13 @@ def processar_fonte(df, col_nota, col_data, col_valor, col_evento, usar_data):
         res['evento'] = ""
 
     res = res[res['nota'] != ""]
-    # Célula de valor em branco (não "0,00" real) => desconsidera a linha, não trata como presença com valor zero
-    res = res[~res['_valor_vazio']].drop(columns=['_valor_vazio'])
+
+    # Célula vazia sempre é descartada. Para a Domínio, valor 0,00 também é descartado
+    # (lançamento cancelado no sistema não deve virar divergência falsa).
+    descartar = res['_valor_vazio']
+    if desconsiderar_zero:
+        descartar = descartar | (res['valor'].abs() < 0.005)
+    res = res[~descartar].drop(columns=['_valor_vazio'])
 
     if usar_data:
         res = res.dropna(subset=['data'])
@@ -218,8 +227,12 @@ def processar_fonte(df, col_nota, col_data, col_valor, col_evento, usar_data):
     else:
         chave = ['nota']
 
+    # Duplicidade: mesma chave E mesmo valor repetidos no arquivo original
+    dup_mask = res.duplicated(subset=chave + ['valor'], keep=False)
+    notas_duplicadas = set(res.loc[dup_mask, 'nota'])
+
     agrupado = res.groupby(chave, as_index=False).agg({'valor': 'sum', 'evento': 'last'})
-    return agrupado
+    return agrupado, notas_duplicadas
 
 def detectar_empresa(df):
     """Procura coluna de razão social/nome da empresa e retorna o valor mais frequente."""
@@ -254,6 +267,30 @@ def detectar_competencia(df, col_data):
                 return moda.iloc[0]
     return None
 
+def obter_empresa_sugerida(dados_fontes):
+    """Prioriza o cabeçalho/metadados da Domínio, depois metadados de outras fontes,
+    depois detecção por coluna (Domínio primeiro)."""
+    ordem = (["Dominio"] if "Dominio" in dados_fontes else []) + [c for c in dados_fontes if c != "Dominio"]
+    for codigo in ordem:
+        meta = dados_fontes[codigo].get("metadados") or {}
+        if meta.get("empresa"):
+            return meta["empresa"]
+    for codigo in ordem:
+        if dados_fontes[codigo].get("empresa_detectada"):
+            return dados_fontes[codigo]["empresa_detectada"]
+    return None
+
+def obter_competencia_sugerida(dados_fontes):
+    ordem = (["Dominio"] if "Dominio" in dados_fontes else []) + [c for c in dados_fontes if c != "Dominio"]
+    for codigo in ordem:
+        meta = dados_fontes[codigo].get("metadados") or {}
+        if meta.get("competencia"):
+            return meta["competencia"]
+    for codigo in ordem:
+        if dados_fontes[codigo].get("competencia_detectada"):
+            return dados_fontes[codigo]["competencia_detectada"]
+    return None
+
 # =========================================================
 # INTERFACE
 # =========================================================
@@ -268,14 +305,14 @@ TIPOS_DOC = {
 }
 
 FONTES_DISPONIVEIS = {
-    "Fonte Originária (SEFAZ/Prefeitura)": "Origem",
+    "Fonte Oficial (SEFAZ/Prefeitura)": "Origem",
     "SIEG": "SIEG",
     "Domínio": "Dominio",
 }
 
 # Nome fixo de coluna de valor por fonte, para o relatório final
 NOME_COLUNA_VALOR = {
-    "Origem": "Valor Fonte Originária",
+    "Origem": "Valor Fonte Oficial",
     "SIEG": "Valor SIEG",
     "Dominio": "Valor Domínio",
 }
@@ -315,7 +352,7 @@ for i, fonte in enumerate(fontes_selecionadas):
         st.markdown(f"**📊 {fonte}**")
         f_upload = st.file_uploader(f"Relatório — {fonte}", type=["xlsx", "xls", "csv"], key=f"upload_{codigo}")
         if f_upload:
-            df_bruto = carregar_planilha(f_upload)
+            df_bruto, metadados = carregar_planilha(f_upload)
             if not df_bruto.empty:
                 cols = list(df_bruto.columns)
                 idx_nota, idx_data, idx_valor, idx_evento = sugerir_colunas(cols)
@@ -336,15 +373,16 @@ for i, fonte in enumerate(fontes_selecionadas):
                     "fonte": fonte, "df": df_bruto,
                     "col_nota": col_nota, "col_data": col_data,
                     "col_valor": col_valor, "col_evento": col_evento,
+                    "metadados": metadados,
                     "empresa_detectada": detectar_empresa(df_bruto),
                     "competencia_detectada": detectar_competencia(df_bruto, col_data),
                 }
 
 st.write("---")
 
-# --- Empresa e Competência: auto-preenchidas a partir das planilhas, mas editáveis ---
-empresa_sugerida = next((d["empresa_detectada"] for d in dados_fontes.values() if d.get("empresa_detectada")), None)
-competencia_sugerida = next((d["competencia_detectada"] for d in dados_fontes.values() if d.get("competencia_detectada")), None)
+# --- Empresa e Competência: auto-preenchidas a partir das planilhas (prioridade: Domínio), mas editáveis ---
+empresa_sugerida = obter_empresa_sugerida(dados_fontes)
+competencia_sugerida = obter_competencia_sugerida(dados_fontes)
 
 if empresa_sugerida and not st.session_state.get("empresa_input"):
     st.session_state["empresa_input"] = empresa_sugerida
@@ -380,9 +418,14 @@ if st.button("🚀 Cruzar Dados e Buscar Divergências", type="primary", use_con
     with st.spinner("Cruzando informações fiscais..."):
         try:
             processados = {}
+            duplicadas_por_fonte = {}
             for codigo in fontes_prontas:
                 cfg = dados_fontes[codigo]
-                agrupado = processar_fonte(cfg["df"], cfg["col_nota"], cfg["col_data"], cfg["col_valor"], cfg["col_evento"], usar_data)
+                agrupado, notas_dup = processar_fonte(
+                    cfg["df"], cfg["col_nota"], cfg["col_data"], cfg["col_valor"], cfg["col_evento"], usar_data,
+                    desconsiderar_zero=(codigo == "Dominio")
+                )
+                duplicadas_por_fonte[codigo] = notas_dup
                 rename_map = {"valor": f"valor_{codigo}", "evento": f"evento_{codigo}"}
                 if not usar_data:
                     rename_map["data"] = f"data_{codigo}"
@@ -399,54 +442,54 @@ if st.button("🚀 Cruzar Dados e Buscar Divergências", type="primary", use_con
 
             totais = {codigo: m[f"valor_{codigo}"].fillna(0).sum() for codigo in fontes_prontas}
 
-            metricas = st.columns(len(fontes_prontas))
-            for i, codigo in enumerate(fontes_prontas):
-                with metricas[i]:
-                    st.metric(f"Soma {dados_fontes[codigo]['fonte']}", formatar_moeda_br(totais[codigo]))
-
-            # Diferença Total em destaque quando só há 2 fontes (comportamento anterior)
+            # Cartões de totais — e, com só 2 fontes, a diferença já entra na MESMA linha
             if len(fontes_prontas) == 2:
                 codigo_a, codigo_b = fontes_prontas
                 diferenca_total = totais[codigo_a] - totais[codigo_b]
-                st.metric(
-                    "Diferença Total",
-                    formatar_moeda_br(diferenca_total),
-                    delta=f"{diferenca_total:,.2f} R$" if abs(diferenca_total) > 0.01 else None,
-                    delta_color="inverse" if abs(diferenca_total) > 0.01 else "normal"
-                )
+                metricas = st.columns(3)
+                with metricas[0]:
+                    st.metric(f"Soma {dados_fontes[codigo_a]['fonte']}", formatar_moeda_br(totais[codigo_a]))
+                with metricas[1]:
+                    st.metric(f"Soma {dados_fontes[codigo_b]['fonte']}", formatar_moeda_br(totais[codigo_b]))
+                with metricas[2]:
+                    st.metric(
+                        "Diferença Total",
+                        formatar_moeda_br(diferenca_total),
+                        delta=f"{diferenca_total:,.2f} R$" if abs(diferenca_total) > 0.01 else None,
+                        delta_color="inverse" if abs(diferenca_total) > 0.01 else "normal"
+                    )
+            else:
+                metricas = st.columns(len(fontes_prontas))
+                for i, codigo in enumerate(fontes_prontas):
+                    with metricas[i]:
+                        st.metric(f"Soma {dados_fontes[codigo]['fonte']}", formatar_moeda_br(totais[codigo]))
 
-            # Resumo por relatório: valor total e diferença vs referência (Domínio se presente, senão a 1ª fonte)
-            referencia = "Dominio" if "Dominio" in fontes_prontas else fontes_prontas[0]
-            nome_referencia = dados_fontes[referencia]["fonte"]
-            total_referencia = totais[referencia]
-
-            resumo_linhas = []
-            for codigo in fontes_prontas:
-                linha = {"Relatório": dados_fontes[codigo]["fonte"], "Valor Total": totais[codigo]}
-                linha[f"Diferença vs {nome_referencia}"] = totais[codigo] - total_referencia
-                resumo_linhas.append(linha)
-            resumo_df = pd.DataFrame(resumo_linhas)
-
-            st.markdown(f"**Resumo por relatório** (referência: {nome_referencia})")
-            resumo_exib = resumo_df.copy()
-            resumo_exib["Valor Total"] = resumo_exib["Valor Total"].apply(formatar_moeda_br)
-            resumo_exib[f"Diferença vs {nome_referencia}"] = resumo_exib[f"Diferença vs {nome_referencia}"].apply(formatar_moeda_br)
-            st.dataframe(resumo_exib, use_container_width=True, hide_index=True)
-
-            # Comparação completa entre todas as fontes (só quando há 3) — escondida por padrão
-            matriz_df = None
+            # Resumo por relatório — só com 3 fontes (com 2, o cartão acima já fecha a informação).
+            # Comparações em pares: primeiro cada fonte vs a referência (Domínio, se houver),
+            # depois o par restante entre as duas não-referência — fechando a triangulação
+            # (ex: Fonte Oficial vs SIEG), em vez de repetir Domínio x Domínio.
+            resumo_df = None
             if len(fontes_prontas) == 3:
-                nomes = [dados_fontes[c]["fonte"] for c in fontes_prontas]
-                matriz_df = pd.DataFrame(index=nomes, columns=nomes, dtype=float)
-                for ca in fontes_prontas:
-                    for cb in fontes_prontas:
-                        matriz_df.loc[dados_fontes[ca]["fonte"], dados_fontes[cb]["fonte"]] = totais[ca] - totais[cb]
+                referencia = "Dominio" if "Dominio" in fontes_prontas else fontes_prontas[0]
+                nome_referencia = dados_fontes[referencia]["fonte"]
+                outras = [c for c in fontes_prontas if c != referencia]
+                pares = [(referencia, c) for c in outras] + [(outras[0], outras[1])]
 
-                with st.expander("🔍 Ver comparação completa entre as 3 fontes (todos os pares)"):
-                    st.dataframe(matriz_df.apply(lambda col: col.map(formatar_moeda_br)), use_container_width=True)
-                    st.caption("Cada célula é (linha − coluna). Ex: a célula SIEG/Domínio mostra o quanto o total do SIEG está acima ou abaixo do total da Domínio.")
+                resumo_linhas = []
+                for a, b in pares:
+                    nome_a, nome_b = dados_fontes[a]["fonte"], dados_fontes[b]["fonte"]
+                    resumo_linhas.append({
+                        "Comparação": f"{nome_a} vs {nome_b}",
+                        "Diferença": totais[a] - totais[b]
+                    })
+                resumo_df = pd.DataFrame(resumo_linhas)
 
-            # --- Análise linha a linha: ausências e divergência de valor ---
+                st.markdown(f"**Resumo por relatório** (referência: {nome_referencia})")
+                resumo_exib = resumo_df.copy()
+                resumo_exib["Diferença"] = resumo_exib["Diferença"].apply(formatar_moeda_br)
+                st.dataframe(resumo_exib, use_container_width=True, hide_index=True)
+
+            # --- Análise linha a linha: ausências, divergência de valor e duplicidade ---
             def analisar_linha(row):
                 ausentes = [c for c in fontes_prontas if pd.isna(row[f"valor_{c}"])]
                 presentes = {c: row[f"valor_{c}"] for c in fontes_prontas if c not in ausentes}
@@ -459,16 +502,24 @@ if st.button("🚀 Cruzar Dados e Buscar Divergências", type="primary", use_con
                     if max(vals) - min(vals) > 0.01:
                         situacoes.append("Valor divergente")
 
-                status_partes = []
                 for c in fontes_prontas:
-                    ev = row.get(f"evento_{c}", "")
-                    if isinstance(ev, str) and ev.strip():
-                        status_partes.append(f"{dados_fontes[c]['fonte']}: {ev.strip()}")
+                    if row["nota"] in duplicadas_por_fonte.get(c, set()):
+                        situacoes.append(f"Nota duplicada no {dados_fontes[c]['fonte']}")
+
+                divergente = bool(situacoes)
+
+                # Status de cancelamento/denegação: só entra no motivo se já há alguma
+                # inconsistência real acima — não dispara divergência sozinho.
+                motivo_partes = list(situacoes)
+                if divergente:
+                    for c in fontes_prontas:
+                        ev = row.get(f"evento_{c}", "")
+                        if isinstance(ev, str) and ev.strip():
+                            motivo_partes.append(f"{dados_fontes[c]['fonte']}: {ev.strip()}")
 
                 return pd.Series({
-                    "Motivo da Inconsistência": " | ".join(situacoes),
-                    "Status (Cancelamento/Denegação)": " | ".join(status_partes),
-                    "_divergente": bool(situacoes)
+                    "Motivo da Inconsistência": " | ".join(motivo_partes),
+                    "_divergente": divergente
                 })
 
             extras = m.apply(analisar_linha, axis=1)
@@ -498,10 +549,9 @@ if st.button("🚀 Cruzar Dados e Buscar Divergências", type="primary", use_con
             else:
                 st.warning(f"Foram identificadas {len(divergencias)} notas com inconsistências.")
 
-                # Montagem da tabela de exibição (moeda formatada)
+                # Montagem da tabela de exibição (moeda formatada) — Empresa/Competência ficam
+                # só no título/cabeçalho, não repetidas linha a linha.
                 exib = pd.DataFrame()
-                if empresa: exib["Empresa"] = empresa
-                if competencia: exib["Competência"] = competencia
                 exib["Número da Nota"] = divergencias["nota"]
                 if mostrar_data:
                     exib["Data"] = pd.to_datetime(divergencias["Data"], errors='coerce').dt.strftime('%d/%m/%Y')
@@ -512,29 +562,34 @@ if st.button("🚀 Cruzar Dados e Buscar Divergências", type="primary", use_con
                     )
 
                 exib["Motivo da Inconsistência"] = divergencias["Motivo da Inconsistência"]
-                exib["Status (Cancelamento/Denegação)"] = divergencias["Status (Cancelamento/Denegação)"]
                 exib = exib.reset_index(drop=True)
 
                 st.dataframe(exib, use_container_width=True)
 
                 # Exportação em Excel (valores numéricos, não formatados, para o usuário trabalhar em cima)
                 export_df = pd.DataFrame()
-                if empresa: export_df["Empresa"] = [empresa] * len(divergencias)
-                if competencia: export_df["Competência"] = [competencia] * len(divergencias)
                 export_df["Número da Nota"] = divergencias["nota"].values
                 if mostrar_data:
                     export_df["Data"] = pd.to_datetime(divergencias["Data"], errors='coerce').dt.strftime('%d/%m/%Y').values
                 for c in fontes_prontas:
                     export_df[NOME_COLUNA_VALOR[c]] = divergencias[f"valor_{c}"].values
                 export_df["Motivo da Inconsistência"] = divergencias["Motivo da Inconsistência"].values
-                export_df["Status (Cancelamento/Denegação)"] = divergencias["Status (Cancelamento/Denegação)"].values
 
                 output = io.BytesIO()
+                linha_inicio = 3  # espaço para o cabeçalho (Empresa/Competência/Tipo)
                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    export_df.to_excel(writer, index=False, sheet_name='Divergências')
-                    resumo_df.to_excel(writer, index=False, sheet_name='Resumo')
-                    if matriz_df is not None:
-                        matriz_df.to_excel(writer, sheet_name='Comparação Completa')
+                    export_df.to_excel(writer, index=False, sheet_name='Divergências', startrow=linha_inicio)
+                    ws = writer.sheets['Divergências']
+                    ws.write(0, 0, f"Empresa: {empresa or '-'}")
+                    ws.write(1, 0, f"Competência: {competencia or '-'}")
+                    ws.write(2, 0, f"Tipo de Documento: {tipo_doc}")
+
+                    if resumo_df is not None and not resumo_df.empty:
+                        resumo_df.to_excel(writer, index=False, sheet_name='Resumo', startrow=linha_inicio)
+                        ws2 = writer.sheets['Resumo']
+                        ws2.write(0, 0, f"Empresa: {empresa or '-'}")
+                        ws2.write(1, 0, f"Competência: {competencia or '-'}")
+                        ws2.write(2, 0, f"Tipo de Documento: {tipo_doc}")
 
                 partes_nome = [p for p in [empresa, competencia, tipo_doc.replace(' ', '_')] if p]
                 nome_arquivo = "divergencias_" + "_".join(partes_nome).replace('/', '-').replace(' ', '_') + ".xlsx"
