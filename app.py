@@ -499,37 +499,39 @@ if st.button("🚀 Cruzar Dados e Buscar Divergências", type="primary", use_con
                 resumo_exib["Diferença"] = resumo_exib["Diferença"].apply(formatar_moeda_br)
                 st.dataframe(resumo_exib, use_container_width=True, hide_index=True)
 
-            # --- Análise linha a linha: ausências, divergência de valor e duplicidade ---
+            # --- Análise linha a linha: ausências (só disparam a linha, sem texto), ---
+            # --- divergência de valor, duplicidade e status de cancelamento/denegação ---
             def analisar_linha(row):
                 ausentes = [c for c in fontes_prontas if pd.isna(row[f"valor_{c}"])]
                 presentes = {c: row[f"valor_{c}"] for c in fontes_prontas if c not in ausentes}
-                situacoes = []
-                if ausentes:
-                    nomes_ausentes = [dados_fontes[c]["fonte"] for c in ausentes]
-                    situacoes.append("Ausente em: " + ", ".join(nomes_ausentes))
+
+                # "Ausente" já fica visualmente claro pela célula em branco — não vira texto no Motivo.
+                gatilhos = bool(ausentes)
+
+                motivo_partes = []
                 if len(presentes) >= 2:
                     vals = list(presentes.values())
                     if max(vals) - min(vals) > 0.01:
-                        situacoes.append("Valor divergente")
+                        motivo_partes.append("Valor divergente")
+                        gatilhos = True
 
                 for c in fontes_prontas:
                     if row["nota"] in duplicadas_por_fonte.get(c, set()):
-                        situacoes.append(f"Nota duplicada no {dados_fontes[c]['fonte']}")
+                        motivo_partes.append(f"Nota duplicada no {dados_fontes[c]['fonte']}")
+                        gatilhos = True
 
-                divergente = bool(situacoes)
-
-                # Status de cancelamento/denegação: só entra no motivo se já há alguma
-                # inconsistência real acima — não dispara divergência sozinho.
-                motivo_partes = list(situacoes)
-                if divergente:
-                    for c in fontes_prontas:
-                        ev = row.get(f"evento_{c}", "")
-                        if isinstance(ev, str) and ev.strip():
-                            motivo_partes.append(f"{dados_fontes[c]['fonte']}: {ev.strip()}")
+                # Status de cancelamento/denegação (SIEG: "Tipo de Evento", ou qualquer coluna de
+                # status com Cancelamento/Desc. de Operação) — quando detectado, entra no motivo
+                # e por si só já justifica mostrar a nota (vale a pena revisar mesmo se os valores baterem).
+                for c in fontes_prontas:
+                    ev = row.get(f"evento_{c}", "")
+                    if isinstance(ev, str) and ev.strip():
+                        motivo_partes.append(f"{dados_fontes[c]['fonte']}: {ev.strip()}")
+                        gatilhos = True
 
                 return pd.Series({
                     "Motivo da Inconsistência": " | ".join(motivo_partes),
-                    "_divergente": divergente
+                    "_divergente": gatilhos
                 })
 
             extras = m.apply(analisar_linha, axis=1)
@@ -559,6 +561,10 @@ if st.button("🚀 Cruzar Dados e Buscar Divergências", type="primary", use_con
             else:
                 st.warning(f"Foram identificadas {len(divergencias)} notas com inconsistências.")
 
+                # A coluna Motivo só aparece se houver alguma informação real nela
+                # (status de cancelamento/denegação, valor divergente ou duplicidade).
+                tem_motivo = divergencias["Motivo da Inconsistência"].str.strip().ne("").any()
+
                 # Montagem da tabela de exibição (moeda formatada) — Empresa/Competência ficam
                 # só no título/cabeçalho, não repetidas linha a linha.
                 exib = pd.DataFrame()
@@ -571,7 +577,8 @@ if st.button("🚀 Cruzar Dados e Buscar Divergências", type="primary", use_con
                         lambda v: "" if pd.isna(v) else formatar_moeda_br(v)
                     )
 
-                exib["Motivo da Inconsistência"] = divergencias["Motivo da Inconsistência"]
+                if tem_motivo:
+                    exib["Motivo da Inconsistência"] = divergencias["Motivo da Inconsistência"]
                 exib = exib.reset_index(drop=True)
 
                 st.dataframe(exib, use_container_width=True)
@@ -583,7 +590,8 @@ if st.button("🚀 Cruzar Dados e Buscar Divergências", type="primary", use_con
                     export_df["Data"] = pd.to_datetime(divergencias["Data"], errors='coerce').dt.strftime('%d/%m/%Y').values
                 for c in fontes_prontas:
                     export_df[NOME_COLUNA_VALOR[c]] = divergencias[f"valor_{c}"].values
-                export_df["Motivo da Inconsistência"] = divergencias["Motivo da Inconsistência"].values
+                if tem_motivo:
+                    export_df["Motivo da Inconsistência"] = divergencias["Motivo da Inconsistência"].values
 
                 output = io.BytesIO()
                 linha_inicio = 3  # espaço para o cabeçalho (Empresa/Competência/Tipo)
