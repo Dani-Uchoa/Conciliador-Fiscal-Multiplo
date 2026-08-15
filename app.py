@@ -3,6 +3,10 @@ import pandas as pd
 import re
 import unicodedata
 import io
+import subprocess
+import tempfile
+import shutil
+import os
 from functools import reduce
 
 st.set_page_config(page_title="Conciliador Fiscal Universal", layout="wide")
@@ -14,11 +18,21 @@ st.title("⚖️ Conciliador Fiscal Universal — Multi-Fonte")
 def formatar_moeda_br(valor):
     try:
         valor = float(valor)
-        s = f"{valor:,.2f}"
-        s = s.replace(",", "X").replace(".", ",").replace("X", ".")
-        return f"R$ {s}"
     except:
         return "R$ 0,00"
+    negativo = valor < 0
+    valor = abs(valor)
+    inteiro, centavos = divmod(round(valor * 100), 100)
+    inteiro_str = str(int(inteiro))
+    # Agrupa os milhares manualmente com ponto (sem depender de replace em cadeia)
+    grupos = []
+    while len(inteiro_str) > 3:
+        grupos.insert(0, inteiro_str[-3:])
+        inteiro_str = inteiro_str[:-3]
+    grupos.insert(0, inteiro_str)
+    parte_inteira = ".".join(grupos)
+    sinal = "-" if negativo else ""
+    return f"{sinal}R$ {parte_inteira},{int(centavos):02d}"
 
 def normalizar(txt):
     if pd.isna(txt): return ""
@@ -133,10 +147,72 @@ def extrair_metadados(df_raw, idx_cabecalho):
 # =========================================================
 # MOTOR DE LEITURA (mantido do original — cobre CSV, XLS/XLSX, HTML disfarçado)
 # =========================================================
-def carregar_planilha(f):
+# Alguns portais (ex: ISS Fortaleza, Domínio) exportam um único arquivo com várias abas —
+# uma para cada tipo de documento. Mapeia tipo de nota -> nomes de aba possíveis.
+ABAS_POR_TIPO = {
+    "NFSe Saída": ["SERVICOS PRESTADOS", "SERVIÇOS PRESTADOS"],
+    "NFSe Entrada": ["SERVICOS TOMADOS", "SERVIÇOS TOMADOS"],
+}
+
+def _reparar_xls_via_libreoffice(conteudo):
+    """Alguns .xls do Domínio vêm com a estrutura binária truncada/malformada —
+    o xlrd recusa, mas o LibreOffice (mesmo motor que roda por trás do 'Salvar Como'
+    no Excel) consegue reconstruir. Retorna os bytes do .xlsx convertido, ou None
+    se o LibreOffice não estiver disponível ou a conversão falhar."""
+    if not shutil.which("soffice"):
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        entrada = os.path.join(tmp, "arquivo.xls")
+        with open(entrada, "wb") as fh:
+            fh.write(conteudo)
+        perfil = os.path.join(tmp, "perfil_lo")
+        try:
+            subprocess.run(
+                ["soffice", "--headless", "--norestore",
+                 f"-env:UserInstallation=file://{perfil}",
+                 "--convert-to", "xlsx", "--outdir", tmp, entrada],
+                timeout=60, capture_output=True, check=True
+            )
+        except Exception:
+            return None
+        saida = os.path.join(tmp, "arquivo.xlsx")
+        if os.path.exists(saida):
+            with open(saida, "rb") as fh:
+                return fh.read()
+    return None
+
+def _ler_excel_com_selecao_aba(conteudo, motor, tipo_doc):
+    """Lê um Excel escolhendo a aba certa conforme o tipo de documento (quando o
+    arquivo tem várias abas), com o mesmo tratamento de 'texto esmagado numa coluna só'
+    do fluxo original."""
+    sheet_name = 0
+    aba_usada = None
+    try:
+        xls = pd.ExcelFile(io.BytesIO(conteudo), engine=motor)
+        if len(xls.sheet_names) > 1:
+            candidatos_norm = {normalizar(s): s for s in xls.sheet_names}
+            termos = ABAS_POR_TIPO.get(tipo_doc, [])
+            for termo in termos:
+                if termo in candidatos_norm:
+                    sheet_name = candidatos_norm[termo]
+                    break
+            aba_usada = sheet_name if sheet_name != 0 else xls.sheet_names[0]
+    except Exception:
+        pass
+
+    df = pd.read_excel(io.BytesIO(conteudo), header=None, dtype=str, engine=motor, sheet_name=sheet_name)
+    if len(df.columns) == 1 or df.iloc[:, 1:].isna().all().all():
+        texto_esmagado = df.iloc[:, 0].dropna().astype(str).str.cat(sep='\n')
+        if texto_esmagado.strip():
+            separador = ';' if ';' in texto_esmagado.split('\n')[0] else ','
+            df = pd.read_csv(io.StringIO(texto_esmagado), sep=separador, dtype=str, header=None, engine='python', on_bad_lines='skip')
+    return df, aba_usada
+
+def carregar_planilha(f, tipo_doc=None):
     f.seek(0)
     conteudo = f.read()
     df = None
+    aba_usada = None
 
     if f.name.lower().endswith('.csv'):
         try: texto = conteudo.decode('utf-8')
@@ -152,15 +228,19 @@ def carregar_planilha(f):
         if is_real_xls or is_real_xlsx:
             motor = 'openpyxl' if is_real_xlsx else 'xlrd'
             try:
-                df = pd.read_excel(io.BytesIO(conteudo), header=None, dtype=str, engine=motor)
-                if len(df.columns) == 1 or df.iloc[:, 1:].isna().all().all():
-                    texto_esmagado = df.iloc[:, 0].dropna().astype(str).str.cat(sep='\n')
-                    if texto_esmagado.strip():
-                        separador = ';' if ';' in texto_esmagado.split('\n')[0] else ','
-                        df = pd.read_csv(io.StringIO(texto_esmagado), sep=separador, dtype=str, header=None, engine='python', on_bad_lines='skip')
+                df, aba_usada = _ler_excel_com_selecao_aba(conteudo, motor, tipo_doc)
             except Exception:
-                st.error(f"🛑 **ARQUIVO CORROMPIDO NA ORIGEM:** O arquivo '{f.name}' exportado pelo sistema possui defeitos na matriz binária. \n\nPara garantir a integridade da conciliação, abra este arquivo no Excel do seu computador e selecione **'Salvar Como -> Pasta de Trabalho do Excel (.xlsx)'** antes de enviar.")
-                return pd.DataFrame(), {}
+                reparado = _reparar_xls_via_libreoffice(conteudo)
+                if reparado:
+                    try:
+                        df, aba_usada = _ler_excel_com_selecao_aba(reparado, 'openpyxl', tipo_doc)
+                        st.info(f"ℹ️ '{f.name}' veio com a estrutura interna corrompida — foi lido após um reparo automático.")
+                    except Exception:
+                        st.error(f"🛑 **ARQUIVO CORROMPIDO NA ORIGEM:** O arquivo '{f.name}' exportado pelo sistema possui defeitos na matriz binária que nem o reparo automático conseguiu contornar. \n\nPara garantir a integridade da conciliação, abra este arquivo no Excel do seu computador e selecione **'Salvar Como -> Pasta de Trabalho do Excel (.xlsx)'** antes de enviar.")
+                        return pd.DataFrame(), {}, None
+                else:
+                    st.error(f"🛑 **ARQUIVO CORROMPIDO NA ORIGEM:** O arquivo '{f.name}' exportado pelo sistema possui defeitos na matriz binária. \n\nPara garantir a integridade da conciliação, abra este arquivo no Excel do seu computador e selecione **'Salvar Como -> Pasta de Trabalho do Excel (.xlsx)'** antes de enviar.")
+                    return pd.DataFrame(), {}, None
         else:
             try:
                 dfs = pd.read_html(io.BytesIO(conteudo))
@@ -173,10 +253,10 @@ def carregar_planilha(f):
                 else: sep = ','
                 df = pd.read_csv(io.StringIO(texto), sep=sep, dtype=str, header=None, engine='python', on_bad_lines='skip')
 
-    if df is None or df.empty: return pd.DataFrame(), {}
+    if df is None or df.empty: return pd.DataFrame(), {}, aba_usada
     idx_cabecalho = encontrar_cabecalho(df)
     metadados = extrair_metadados(df, idx_cabecalho)
-    if idx_cabecalho >= len(df): return df, metadados
+    if idx_cabecalho >= len(df): return df, metadados, aba_usada
 
     nomes_colunas = [str(c).strip() if pd.notna(c) else f"Coluna_{i}" for i, c in enumerate(df.iloc[idx_cabecalho])]
     vistos = {}
@@ -191,13 +271,26 @@ def carregar_planilha(f):
 
     df.columns = nomes_unicos
     df = df.iloc[idx_cabecalho + 1:].reset_index(drop=True)
-    return df, metadados
+    return df, metadados, aba_usada
 
 def sugerir_colunas(cols):
-    idx_nota = next((i for i, c in enumerate(cols) if any(t in normalizar(c) for t in ["CHAVE", "NOTA", "NUMERO", "NUM NFSE", "NUM", "DOC"])), 0)
-    idx_data = next((i for i, c in enumerate(cols) if any(t in normalizar(c) for t in ["DATA", "EMISSAO", "ENTRADA"])), 0)
-    idx_valor = next((i for i, c in enumerate(cols) if any(t in normalizar(c) for t in ["VALOR", "CONTABIL"])), 0)
-    idx_evento = next((i for i, c in enumerate(cols) if ("EVENTO" in normalizar(c) and "CODIGO" not in normalizar(c)) or ("TIPO" in normalizar(c) and "EVENTO" in normalizar(c)) or "STATUS" in normalizar(c) or "SITUACAO" in normalizar(c)), None)
+    norm = [normalizar(c) for c in cols]
+
+    def achar(*grupos_prioridade):
+        """Procura por grupo de termos, em ordem de prioridade. Pula colunas que contenham
+        'TIPO' (ex: 'Tipo Doc.') pra não confundir uma coluna de classificação com a de identificação."""
+        for grupo in grupos_prioridade:
+            for i, c in enumerate(norm):
+                if "TIPO" in c:
+                    continue
+                if any(t in c for t in grupo):
+                    return i
+        return 0
+
+    idx_nota = achar(["CHAVE", "NUM NFSE", "NOTA", "NUMERO"], ["NUM", "DOC"])
+    idx_data = achar(["DATA", "EMISSAO", "ENTRADA"])
+    idx_valor = achar(["VALOR", "CONTABIL"])
+    idx_evento = next((i for i, c in enumerate(norm) if ("EVENTO" in c and "CODIGO" not in c) or ("TIPO" in c and "EVENTO" in c) or "STATUS" in c or "SITUACAO" in c), None)
     return idx_nota, idx_data, idx_valor, idx_evento
 
 # =========================================================
@@ -311,7 +404,8 @@ TIPOS_DOC = {
     "NFe Saída": True,
     "NFCe": True,
     "CTe": True,
-    "NFSe": True,
+    "NFSe Entrada": False,
+    "NFSe Saída": True,
 }
 
 FONTES_DISPONIVEIS = {
@@ -327,104 +421,110 @@ NOME_COLUNA_VALOR = {
     "Dominio": "Valor Domínio",
 }
 
-col_tipo, col_fontes = st.columns(2)
-with col_tipo:
+with st.sidebar:
+    st.header("⚙️ Configuração")
+
     tipo_doc = st.radio("📄 **Tipo de documento fiscal:**", list(TIPOS_DOC.keys()), horizontal=False)
     usar_data = TIPOS_DOC[tipo_doc]
-    mostrar_data = tipo_doc != "NFe Entrada"
+    mostrar_data = "Entrada" not in tipo_doc
     st.caption(
         "Cruzamento automático: **só por número da nota** para Entrada; "
         "**nota + data** para os demais tipos."
     )
 
-with col_fontes:
+    st.divider()
+
     fontes_selecionadas = st.multiselect(
-        "🔗 **Quais fontes você vai subir nesta rodada?** (mín. 2)",
+        "🔗 **Fontes desta rodada** (mín. 2)",
         list(FONTES_DISPONIVEIS.keys()),
         default=list(FONTES_DISPONIVEIS.keys())
     )
 
-st.write("---")
+    st.divider()
 
-if len(fontes_selecionadas) < 2:
-    st.warning("Selecione ao menos 2 fontes para cruzar.")
-    st.stop()
+    # --- Upload e mapeamento de colunas por fonte ---
+    dados_fontes = {}  # codigo -> dict com df bruto e colunas escolhidas
 
-# --- Upload e mapeamento de colunas por fonte ---
-dados_fontes = {}  # codigo -> dict com df bruto e colunas escolhidas
+    for fonte in fontes_selecionadas:
+        codigo = FONTES_DISPONIVEIS[fonte]
+        with st.expander(f"📊 {fonte}", expanded=True):
+            f_upload = st.file_uploader("Relatório", type=["xlsx", "xls", "csv"], key=f"upload_{codigo}")
+            if f_upload:
+                df_bruto, metadados, aba_usada = carregar_planilha(f_upload, tipo_doc)
+                if aba_usada:
+                    st.caption(f"📑 Aba lida: **{aba_usada}**")
+                if not df_bruto.empty:
+                    cols = list(df_bruto.columns)
+                    idx_nota, idx_data, idx_valor, idx_evento = sugerir_colunas(cols)
+                    opcoes_com_nenhuma = ["Nenhuma"] + cols
 
-n_fontes = len(fontes_selecionadas)
-cols_layout = st.columns(n_fontes)
+                    col_nota = st.selectbox("Nota/Chave", cols, index=idx_nota, key=f"nota_{codigo}")
+                    col_data = st.selectbox(
+                        "Data" + (" (obrigatória)" if usar_data else " (opcional, só referência)"),
+                        opcoes_com_nenhuma, index=idx_data + 1, key=f"data_{codigo}"
+                    )
+                    col_valor = st.selectbox("Valor", cols, index=idx_valor, key=f"valor_{codigo}")
 
-for i, fonte in enumerate(fontes_selecionadas):
-    codigo = FONTES_DISPONIVEIS[fonte]
-    with cols_layout[i]:
-        st.markdown(f"**📊 {fonte}**")
-        f_upload = st.file_uploader(f"Relatório — {fonte}", type=["xlsx", "xls", "csv"], key=f"upload_{codigo}")
-        if f_upload:
-            df_bruto, metadados = carregar_planilha(f_upload)
-            if not df_bruto.empty:
-                cols = list(df_bruto.columns)
-                idx_nota, idx_data, idx_valor, idx_evento = sugerir_colunas(cols)
-                opcoes_com_nenhuma = ["Nenhuma"] + cols
+                    # Status/Evento é detectado automaticamente pela varredura das colunas —
+                    # só entra no motivo da inconsistência se realmente existir.
+                    col_evento = cols[idx_evento] if idx_evento is not None else "Nenhuma"
 
-                col_nota = st.selectbox("Nota/Chave", cols, index=idx_nota, key=f"nota_{codigo}")
-                col_data = st.selectbox(
-                    "Data" + (" (obrigatória)" if usar_data else " (opcional, só referência)"),
-                    opcoes_com_nenhuma, index=idx_data + 1, key=f"data_{codigo}"
-                )
-                col_valor = st.selectbox("Valor", cols, index=idx_valor, key=f"valor_{codigo}")
+                    dados_fontes[codigo] = {
+                        "fonte": fonte, "df": df_bruto,
+                        "col_nota": col_nota, "col_data": col_data,
+                        "col_valor": col_valor, "col_evento": col_evento,
+                        "metadados": metadados,
+                        "empresa_detectada": detectar_empresa(df_bruto),
+                        "competencia_detectada": detectar_competencia(df_bruto, col_data),
+                    }
 
-                # Status/Evento é detectado automaticamente pela varredura das colunas —
-                # só entra no motivo da inconsistência se realmente existir.
-                col_evento = cols[idx_evento] if idx_evento is not None else "Nenhuma"
+    st.divider()
 
-                dados_fontes[codigo] = {
-                    "fonte": fonte, "df": df_bruto,
-                    "col_nota": col_nota, "col_data": col_data,
-                    "col_valor": col_valor, "col_evento": col_evento,
-                    "metadados": metadados,
-                    "empresa_detectada": detectar_empresa(df_bruto),
-                    "competencia_detectada": detectar_competencia(df_bruto, col_data),
-                }
+    # --- Empresa e Competência: auto-preenchidas a partir das planilhas (prioridade: Domínio), mas editáveis ---
+    empresa_sugerida = obter_empresa_sugerida(dados_fontes)
+    competencia_sugerida = obter_competencia_sugerida(dados_fontes)
 
-st.write("---")
+    if empresa_sugerida and not st.session_state.get("empresa_input"):
+        st.session_state["empresa_input"] = empresa_sugerida
+    if competencia_sugerida and not st.session_state.get("competencia_input"):
+        st.session_state["competencia_input"] = competencia_sugerida
 
-# --- Empresa e Competência: auto-preenchidas a partir das planilhas (prioridade: Domínio), mas editáveis ---
-empresa_sugerida = obter_empresa_sugerida(dados_fontes)
-competencia_sugerida = obter_competencia_sugerida(dados_fontes)
-
-if empresa_sugerida and not st.session_state.get("empresa_input"):
-    st.session_state["empresa_input"] = empresa_sugerida
-if competencia_sugerida and not st.session_state.get("competencia_input"):
-    st.session_state["competencia_input"] = competencia_sugerida
-
-col_emp, col_comp = st.columns(2)
-with col_emp:
     empresa = st.text_input("🏢 Empresa", key="empresa_input")
     if empresa_sugerida:
-        st.caption("🔎 Detectado automaticamente a partir da planilha — pode editar.")
-with col_comp:
+        st.caption("🔎 Detectado automaticamente — pode editar.")
     competencia = st.text_input("🗓️ Competência (ex: 08/2026)", key="competencia_input")
     if competencia_sugerida:
-        st.caption("🔎 Detectado automaticamente a partir da planilha — pode editar.")
+        st.caption("🔎 Detectado automaticamente — pode editar.")
 
-st.write("---")
+    st.divider()
+    fontes_prontas = list(dados_fontes.keys())
+    pronto_para_cruzar = len(fontes_selecionadas) >= 2 and len(fontes_prontas) >= 2
+    if usar_data and pronto_para_cruzar:
+        faltando_data_sb = [dados_fontes[c]["fonte"] for c in fontes_prontas if dados_fontes[c]["col_data"] == "Nenhuma"]
+        if faltando_data_sb:
+            pronto_para_cruzar = False
 
+    acionar_cruzamento = st.button(
+        "🚀 Cruzar Dados e Buscar Divergências", type="primary",
+        use_container_width=True, disabled=not pronto_para_cruzar
+    )
 
+# --- Validações e mensagens no corpo principal (visíveis mesmo com a barra lateral fechada) ---
+if len(fontes_selecionadas) < 2:
+    st.warning("⬅️ Selecione ao menos 2 fontes na barra lateral para cruzar.")
+    st.stop()
 
-fontes_prontas = list(dados_fontes.keys())
 if len(fontes_prontas) < 2:
-    st.info("Suba pelo menos 2 relatórios com as colunas mapeadas para liberar o cruzamento.")
+    st.info("⬅️ Suba pelo menos 2 relatórios na barra lateral, com as colunas mapeadas, para liberar o cruzamento.")
     st.stop()
 
 if usar_data:
     faltando_data = [dados_fontes[c]["fonte"] for c in fontes_prontas if dados_fontes[c]["col_data"] == "Nenhuma"]
     if faltando_data:
-        st.error(f"Você marcou 'cruzar por data', mas não selecionou coluna de data para: {', '.join(faltando_data)}.")
+        st.error(f"Você está cruzando por data, mas não há coluna de data selecionada para: {', '.join(faltando_data)}. Ajuste na barra lateral.")
         st.stop()
 
-if st.button("🚀 Cruzar Dados e Buscar Divergências", type="primary", use_container_width=True):
+if acionar_cruzamento:
     with st.spinner("Cruzando informações fiscais..."):
         try:
             processados = {}
@@ -465,7 +565,7 @@ if st.button("🚀 Cruzar Dados e Buscar Divergências", type="primary", use_con
                     st.metric(
                         "Diferença Total",
                         formatar_moeda_br(diferenca_total),
-                        delta=f"{diferenca_total:,.2f} R$" if abs(diferenca_total) > 0.01 else None,
+                        delta=formatar_moeda_br(diferenca_total) if abs(diferenca_total) > 0.01 else None,
                         delta_color="inverse" if abs(diferenca_total) > 0.01 else "normal"
                     )
             else:
@@ -606,6 +706,13 @@ if st.button("🚀 Cruzar Dados e Buscar Divergências", type="primary", use_con
                     ws.write(1, 0, f"Competência: {competencia or '-'}")
                     ws.write(2, 0, f"Tipo de Documento: {tipo_doc}")
 
+                    # Formato contábil BR nas colunas de valor — o próprio Excel exibe com
+                    # separador de milhar/decimal certos conforme a configuração regional do usuário.
+                    formato_moeda = writer.book.add_format({'num_format': '#,##0.00'})
+                    for c in fontes_prontas:
+                        idx_col = export_df.columns.get_loc(NOME_COLUNA_VALOR[c])
+                        ws.set_column(idx_col, idx_col, 16, formato_moeda)
+
                     # Aba Resumo: valor total de todas as fontes sempre presente,
                     # + comparação em pares quando há 3 fontes.
                     totais_df.to_excel(writer, index=False, sheet_name='Resumo', startrow=linha_inicio)
@@ -613,6 +720,9 @@ if st.button("🚀 Cruzar Dados e Buscar Divergências", type="primary", use_con
                     ws2.write(0, 0, f"Empresa: {empresa or '-'}")
                     ws2.write(1, 0, f"Competência: {competencia or '-'}")
                     ws2.write(2, 0, f"Tipo de Documento: {tipo_doc}")
+                    # Coluna 1 é sempre o valor monetário, tanto na tabela de totais quanto na
+                    # de comparação em pares (ambas ficam na mesma coluna B da aba).
+                    ws2.set_column(1, 1, 16, formato_moeda)
 
                     if resumo_df is not None and not resumo_df.empty:
                         inicio_comparacao = linha_inicio + len(totais_df) + 3
